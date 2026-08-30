@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { timingSafeEqual } from "node:crypto";
 import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -18,6 +19,7 @@ if (!token) {
 }
 const region = process.env.ED_REGION ?? "us";
 const port = Number(process.env.PORT ?? 3000);
+const accessToken = process.env.MCP_ACCESS_TOKEN;
 const api = new EdApiClient(token, region);
 
 function errorText(err: unknown): string {
@@ -548,8 +550,35 @@ async function runStdio() {
   console.error(`edstem-mcp server running on stdio (region: ${region})`);
 }
 
+function isAuthorized(header: string | undefined): boolean {
+  if (!accessToken || !header?.startsWith("Bearer ")) {
+    return false;
+  }
+  const provided = Buffer.from(header.slice(7));
+  const expected = Buffer.from(accessToken);
+  return provided.length === expected.length && timingSafeEqual(provided, expected);
+}
+
 function runHttp() {
+  if (!accessToken) {
+    console.error("MCP_ACCESS_TOKEN environment variable is required for MCP_TRANSPORT=http.");
+    process.exit(1);
+  }
+
   const app = express();
+
+  app.use((req, res, next) => {
+    if (!isAuthorized(req.header("authorization"))) {
+      res.status(401).json({
+        jsonrpc: "2.0",
+        error: { code: -32001, message: "Unauthorized" },
+        id: null,
+      });
+      return;
+    }
+    next();
+  });
+
   app.use(express.json());
 
   // Each request gets its own McpServer + transport pair (sessionIdGenerator:
