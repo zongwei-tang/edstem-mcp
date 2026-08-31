@@ -1,26 +1,20 @@
 #!/usr/bin/env node
-import { timingSafeEqual } from "node:crypto";
 import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { getOAuthProtectedResourceMetadataUrl, mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
+import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { z } from "zod";
 import { EdApiClient, EdApiError } from "./api.js";
+import { EdOAuthProvider, renderConsentPage } from "./oauth.js";
 import type { EdEditThreadParams } from "./types.js";
 import { edXmlToPlainText, ensureEdXml, markdownToEdXml } from "./content.js";
 
 // ── Config ──────────────────────────────────────────────────
 
-const token = process.env.ED_API_TOKEN;
-if (!token) {
-  console.error("ED_API_TOKEN environment variable is required.");
-  console.error("Get one at https://edstem.org/us/settings/api-tokens");
-  process.exit(1);
-}
 const region = process.env.ED_REGION ?? "us";
 const port = Number(process.env.PORT ?? 3000);
-const accessToken = process.env.MCP_ACCESS_TOKEN;
-const api = new EdApiClient(token, region);
 
 function errorText(err: unknown): string {
   if (err instanceof EdApiError) {
@@ -43,7 +37,7 @@ function fail(err: unknown) {
 
 // ── Server ──────────────────────────────────────────────────
 
-function createServer(): McpServer {
+function createServer(api: EdApiClient): McpServer {
   const server = new McpServer({
     name: "edstem",
     version: "1.0.0",
@@ -538,57 +532,135 @@ function createServer(): McpServer {
 //
 // MCP_TRANSPORT picks how this process is exposed (only one runs at a time):
 //   "stdio" (default) — spawned as a local subprocess by a client like
-//                        Claude Desktop, communicates over stdin/stdout
-//   "http"             — stateless Streamable HTTP server on PORT, for
-//                        remote/network clients
+//                        Claude Desktop, communicates over stdin/stdout,
+//                        authenticated as the operator via ED_API_TOKEN
+//   "http"             — Streamable HTTP server on PORT, multi-tenant: it
+//                        fronts an OAuth 2.1 authorization server (see
+//                        oauth.ts) so each remote client authorizes with its
+//                        own Ed Discussion API token instead of a shared one
 
 const transportMode = process.env.MCP_TRANSPORT ?? "stdio";
 
 async function runStdio() {
-  const server = createServer();
+  const token = process.env.ED_API_TOKEN;
+  if (!token) {
+    console.error("ED_API_TOKEN environment variable is required.");
+    console.error("Get one at https://edstem.org/us/settings/api-tokens");
+    process.exit(1);
+  }
+  const api = new EdApiClient(token, region);
+  const server = createServer(api);
   await server.connect(new StdioServerTransport());
   console.error(`edstem-mcp server running on stdio (region: ${region})`);
 }
 
-function isAuthorized(header: string | undefined): boolean {
-  if (!accessToken || !header?.startsWith("Bearer ")) {
-    return false;
+/** The externally-reachable base URL this process is served at — used as the OAuth issuer. */
+function resolvePublicUrl(): URL {
+  if (process.env.PUBLIC_URL) {
+    return new URL(process.env.PUBLIC_URL);
   }
-  const provided = Buffer.from(header.slice(7));
-  const expected = Buffer.from(accessToken);
-  return provided.length === expected.length && timingSafeEqual(provided, expected);
+  if (process.env.RAILWAY_PUBLIC_DOMAIN) {
+    return new URL(`https://${process.env.RAILWAY_PUBLIC_DOMAIN}`);
+  }
+  return new URL(`http://localhost:${port}`);
 }
 
 function runHttp() {
-  if (!accessToken) {
-    console.error("MCP_ACCESS_TOKEN environment variable is required for MCP_TRANSPORT=http.");
-    process.exit(1);
-  }
+  const baseUrl = resolvePublicUrl();
+  const resourceUrl = new URL("/mcp", baseUrl);
+  const oauthProvider = new EdOAuthProvider();
 
   const app = express();
 
-  app.use((req, res, next) => {
-    if (!isAuthorized(req.header("authorization"))) {
-      res.status(401).json({
-        jsonrpc: "2.0",
-        error: { code: -32001, message: "Unauthorized" },
-        id: null,
-      });
+  app.use(
+    mcpAuthRouter({
+      provider: oauthProvider,
+      issuerUrl: baseUrl,
+      resourceServerUrl: resourceUrl,
+      resourceName: "edstem-mcp",
+      scopesSupported: ["edstem"],
+    })
+  );
+
+  // The consent form rendered by EdOAuthProvider#authorize posts here. This
+  // route lives outside the SDK's router (and deliberately isn't nested under
+  // /authorize — that prefix is claimed by mcpAuthRouter's authorization
+  // handler, which would consume the request body before we see it) because
+  // it's the one step in the flow that's specific to us: collecting the
+  // user's own Ed API token, the only credential Ed itself exposes.
+  app.post("/consent", express.urlencoded({ extended: false }), async (req, res) => {
+    const { client_id, redirect_uri, state, code_challenge, resource, scope, ed_api_token, ed_region } =
+      req.body as Record<string, string | undefined>;
+
+    if (!client_id || !redirect_uri || !code_challenge || !ed_api_token) {
+      res.status(400).send("Missing required fields.");
       return;
     }
-    next();
+
+    const client = await oauthProvider.clientsStore.getClient(client_id);
+    if (!client) {
+      res.status(400).send("Unknown client.");
+      return;
+    }
+
+    const edRegion = ed_region?.trim() || "us";
+    const edToken = ed_api_token.trim();
+
+    try {
+      await new EdApiClient(edToken, edRegion).getUser();
+    } catch {
+      res
+        .status(400)
+        .type("html")
+        .send(
+          renderConsentPage({
+            clientName: client.client_name ?? client.client_id,
+            clientId: client_id,
+            redirectUri: redirect_uri,
+            state: state ?? "",
+            codeChallenge: code_challenge,
+            resource: resource ?? "",
+            scope: scope ?? "",
+            error: "That token didn't work against Ed — double check it and try again.",
+          })
+        );
+      return;
+    }
+
+    const code = oauthProvider.issueAuthorizationCode({
+      clientId: client_id,
+      redirectUri: redirect_uri,
+      codeChallenge: code_challenge,
+      edToken,
+      edRegion,
+    });
+
+    const redirectUrl = new URL(redirect_uri);
+    redirectUrl.searchParams.set("code", code);
+    if (state) {
+      redirectUrl.searchParams.set("state", state);
+    }
+    res.redirect(302, redirectUrl.toString());
   });
 
-  app.use(express.json());
+  const requireAuth = requireBearerAuth({
+    verifier: oauthProvider,
+    resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resourceUrl),
+  });
 
-  // Each request gets its own McpServer + transport pair (sessionIdGenerator:
-  // undefined disables session tracking). This keeps the server horizontally
-  // scalable and serverless-friendly, at the cost of not supporting stream
-  // resumption across requests — acceptable here since every tool call is a
+  // Each request gets its own EdApiClient — built from the caller's own Ed
+  // token, resolved off the access token by EdOAuthProvider#verifyAccessToken
+  // — plus its own McpServer + transport pair (sessionIdGenerator: undefined
+  // disables session tracking). This keeps the server horizontally scalable
+  // and serverless-friendly, at the cost of not supporting stream resumption
+  // across requests — acceptable here since every tool call is a
   // self-contained Ed API request.
-  app.post("/mcp", async (req, res) => {
+  app.post("/mcp", requireAuth, express.json(), async (req, res) => {
     try {
-      const server = createServer();
+      const edToken = req.auth?.extra?.edToken as string;
+      const edRegion = (req.auth?.extra?.edRegion as string | undefined) ?? "us";
+      const api = new EdApiClient(edToken, edRegion);
+      const server = createServer(api);
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
       });
@@ -628,7 +700,7 @@ function runHttp() {
   });
 
   app.listen(port, () => {
-    console.error(`edstem-mcp server listening on http://localhost:${port}/mcp (region: ${region})`);
+    console.error(`edstem-mcp server listening on ${resourceUrl.href} (OAuth issuer: ${baseUrl.href})`);
   });
 }
 
