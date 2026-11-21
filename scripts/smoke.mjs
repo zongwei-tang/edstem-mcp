@@ -50,17 +50,26 @@ const enrolled = user.json?.courses?.find((c) => c.course?.id === courseId);
 const ucats = enrolled?.course?.settings?.discussion?.categories;
 row("GET user", user, `enrolled=${!!enrolled} categories=${Array.isArray(ucats) ? ucats.length : "missing"}`);
 
-// 2. Server-side search
-const search = await get(`courses/${courseId}/threads/search?query=the&limit=5`);
-const sres = Array.isArray(search.json) ? search.json : search.json?.threads;
-row("GET threads/search?query=the", search, `results=${Array.isArray(sres) ? sres.length : "?"}`);
-
-// 3. Which sort values change the order? (compares to sort=new, prints no ids)
+// 2. Server-side search. Probe with a word taken from a real thread title
+//    (the word itself is never printed), plus a stopword and the `total` field.
 const ids = (r) => (r.json?.threads ?? []).map((t) => t.id).join(",");
-const baseline = await get(`courses/${courseId}/threads?limit=10&sort=new`);
-row("GET threads?sort=new", baseline);
-for (const sort of ["old", "top", "hot", "trending", "active", "unanswered", "bogus_value"]) {
+const latest = await get(`courses/${courseId}/threads?limit=10&sort=new`);
+const word = (latest.json?.threads ?? [])
+  .flatMap((t) => String(t.title ?? "").split(/[^A-Za-z]+/))
+  .find((w) => w.length >= 5);
+for (const [label, q] of [["stopword 'the'", "the"], ["word from a recent title", word]]) {
+  if (!q) continue;
+  const r = await get(`courses/${courseId}/threads/search?query=${encodeURIComponent(q)}&limit=5`);
+  const list = Array.isArray(r.json) ? r.json : r.json?.threads;
+  row(`GET threads/search (${label})`, r, `results=${Array.isArray(list) ? list.length : "?"} total=${r.json?.total ?? "?"}`);
+}
+
+// 3. Sort values. The server echoes `sort_key`; also compare order with an unknown value,
+//    since an unrecognized sort falls back to some default.
+const bogus = await get(`courses/${courseId}/threads?limit=10&sort=bogus_value`);
+row("GET threads?sort=bogus_value", bogus, `sort_key=${JSON.stringify(bogus.json?.sort_key)}`);
+for (const sort of ["new", "old", "top", "hot", "trending", "active", "unanswered"]) {
   const r = await get(`courses/${courseId}/threads?limit=10&sort=${sort}`);
-  const same = ids(r) === ids(baseline);
-  row(`GET threads?sort=${sort}`, r, r.status === 200 ? (same ? "order=SAME as new" : "order=differs") : "");
+  const same = ids(r) === ids(bogus);
+  row(`GET threads?sort=${sort}`, r, `sort_key=${JSON.stringify(r.json?.sort_key)} order=${same ? "SAME as bogus" : "differs from bogus"}`);
 }
