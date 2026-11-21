@@ -186,16 +186,29 @@ function createServer(opts: ServerOptions): McpServer {
     "List discussion threads in a course",
     {
       course_id: z.number().describe("Course ID"),
-      limit: z.number().min(1).max(100).default(30).describe("Max threads to return (1-100)"),
+      limit: z.number().min(1).max(100).default(30).describe("Max threads to fetch (1-100)"),
       offset: z.number().min(0).default(0).describe("Pagination offset"),
+      // Live-tested 2026-11: Ed honors only "new" and "trending"; any other value
+      // (top, old, hot, unanswered, ...) silently falls back to its default order.
       sort: z
-        .enum(["new", "top", "active", "unanswered"])
+        .enum(["new", "trending", "default"])
         .default("new")
-        .describe("Sort order"),
+        .describe('"new" = newest first, "trending", "default" = Ed\'s default order (as in the web UI)'),
+      unanswered_only: z
+        .boolean()
+        .default(false)
+        .describe("Keep only questions with no answer yet (filtered locally within the fetched page)"),
     },
-    async ({ course_id, limit, offset, sort }) => {
+    async ({ course_id, limit, offset, sort, unanswered_only }) => {
       try {
-        const threads = await api.listThreads(course_id, { limit, offset, sort });
+        let threads = await api.listThreads(course_id, {
+          limit,
+          offset,
+          sort: sort === "default" ? undefined : sort,
+        });
+        if (unanswered_only) {
+          threads = threads.filter((t) => t.type === "question" && !t.is_answered);
+        }
         const summary = threads.map((t) => ({
           id: t.id,
           number: t.number,
@@ -730,7 +743,7 @@ function createServer(opts: ServerOptions): McpServer {
           role: "user" as const,
           content: {
             type: "text" as const,
-            text: `Find all unanswered questions in my course "${course}". Use get_user to find the course ID, then list_threads with sort "unanswered". Show me each question's title, category, when it was posted, and how many replies it has.`,
+            text: `Find all unanswered questions in my course "${course}". Use get_user to find the course ID, then list_threads with sort "new", limit 100 and unanswered_only true (page with offset if you need older ones). Show me each question's title, category, when it was posted, and how many replies it has.`,
           },
         },
       ],
