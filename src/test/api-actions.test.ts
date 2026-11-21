@@ -207,6 +207,12 @@ describe("notifications, polls, lessons", () => {
     assert.equal(res.notes.length, 1);
   });
 
+  it("sends id=0 for the first page of notifications", async () => {
+    mock({ ok: true, status: 200, text: '{"has_more":false,"notes":[]}' });
+    await client.listNotifications();
+    assert.equal(new URL(calls[0].url).searchParams.get("id"), "0");
+  });
+
   it("marks notifications read (some or all) and deletes", async () => {
     mock(EMPTY);
     await client.markNotificationsRead([1, 2]);

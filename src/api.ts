@@ -371,8 +371,8 @@ export class EdApiClient {
   async listNotifications(
     opts: { beforeId?: number; unreadOnly?: boolean } = {}
   ): Promise<{ has_more: boolean; notes: unknown[] }> {
-    const params: Record<string, string | number> = {};
-    if (opts.beforeId !== undefined) params.id = opts.beforeId;
+    // Ed requires `id`; its web client passes 0 for the first page (loadMore()).
+    const params: Record<string, string | number> = { id: opts.beforeId ?? 0 };
     if (opts.unreadOnly) params.unread = 1;
     const res = await this.request<{ has_more?: boolean; notes?: unknown[] }>(
       "GET",

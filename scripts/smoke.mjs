@@ -75,7 +75,7 @@ for (const sort of ["new", "old", "top", "hot", "trending", "active", "unanswere
 }
 
 // 4. Notifications and lessons (read-only)
-const notes = await get("notifications/before");
-row("GET notifications/before", notes, `notes=${Array.isArray(notes.json?.notes) ? notes.json.notes.length : "?"}`);
+const notes = await get("notifications/before?id=0");
+row("GET notifications/before?id=0", notes, `notes=${Array.isArray(notes.json?.notes) ? notes.json.notes.length : "?"}`);
 const lessons = await get(`courses/${courseId}/lessons`);
 row(`GET courses/${courseId}/lessons`, lessons, `lessons=${Array.isArray(lessons.json?.lessons) ? lessons.json.lessons.length : "?"}`);
