@@ -6,7 +6,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z, type ZodRawShape } from "zod";
 import { EdApiClient, EdApiError } from "./api.js";
-import { readFile, stat } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
+import { resolveUploadPath } from "./upload.js";
 import { basename, extname } from "node:path";
 import type { EdEditThreadParams, EdThread } from "./types.js";
 import { edXmlToPlainText, ensureEdXml, markdownToEdXml } from "./content.js";
@@ -107,19 +108,28 @@ for (const name of [
   "endorse_thread", "unendorse_thread", "star_thread", "unstar_thread",
   "vote_thread", "watch_thread", "mark_thread_read",
   "endorse_comment", "unendorse_comment", "vote_comment", "accept_answer",
-  "resolve_comment", "set_comment_type", "restore_thread", "restore_comment", "mark_duplicate",
-  "moderate_thread", "mark_notifications_read", "revoke_poll_vote",
+  "resolve_comment", "restore_thread", "restore_comment", "mark_duplicate", "revoke_poll_vote",
 ]) {
   TOOL_ANNOTATIONS[name] = WRITE_IDEMPOTENT;
 }
-// Wipes unread state for the whole course and cannot be undone.
-TOOL_ANNOTATIONS.mark_all_threads_read = { ...WRITE_IDEMPOTENT, destructiveHint: true };
+// Not undoable, or can expose / reject someone's content.
+for (const name of [
+  "mark_all_threads_read", // wipes unread state for the whole course
+  "mark_notifications_read", // no "unread" endpoint for notifications
+  "set_comment_type", // Ed forces is_private=false
+  "moderate_thread", // reject hides someone else's post
+]) {
+  TOOL_ANNOTATIONS[name] = { ...WRITE_IDEMPOTENT, destructiveHint: true };
+}
 
 // ── Server ──────────────────────────────────────────────────
 
 interface ServerOptions {
-  /** Allow upload_file to read local paths. Only safe when the client is the local user (stdio). */
-  allowLocalFiles: boolean;
+  /**
+   * Directory upload_file may read local files from (ED_UPLOAD_DIR). Undefined disables
+   * local paths. Never set over HTTP: remote clients must not read files on the host.
+   */
+  uploadDir?: string;
 }
 
 function createServer(opts: ServerOptions): McpServer {
@@ -512,7 +522,7 @@ function createServer(opts: ServerOptions): McpServer {
 
   tool(
     "delete_thread",
-    "Delete a thread (Ed soft-deletes; restore_thread undoes it)",
+    "Delete a thread. Ed has a restore endpoint (restore_thread), but whether students may use it is unverified: treat deletion as permanent.",
     { thread_id: z.number().describe("Global thread ID") },
     async ({ thread_id }) => run(() => api.destroy("thread", thread_id), `Thread ${thread_id} deleted.`)
   );
@@ -701,7 +711,7 @@ function createServer(opts: ServerOptions): McpServer {
 
   tool(
     "delete_comment",
-    "Delete a comment or answer (Ed soft-deletes; restore_comment undoes it)",
+    "Delete a comment or answer. Ed has a restore endpoint (restore_comment), but whether students may use it is unverified: treat deletion as permanent.",
     { comment_id: z.number().describe("Comment ID") },
     async ({ comment_id }) => run(() => api.destroy("comment", comment_id), `Comment ${comment_id} deleted.`)
   );
@@ -812,11 +822,14 @@ function createServer(opts: ServerOptions): McpServer {
       "For multiple choice, response is an array of 0-based choice indices.",
     {
       question_id: z.number().describe("Question ID (from get_slide_questions)"),
-      response: z.unknown().describe("Answer payload, e.g. [1] for the second choice"),
+      response: z.any().refine((v) => v !== undefined && v !== null, "response is required").describe("Answer payload, e.g. [1] for the second choice"),
       password,
     },
-    async ({ question_id, response, password }) =>
-      run(() => api.submitQuestionResponse(question_id, response, password))
+    async ({ question_id, response, password }) => {
+      // z.unknown() is optional in the JSON schema; never send an empty answer to a graded endpoint.
+      if (response === undefined || response === null) return fail(new Error("response is required"));
+      return run(() => api.submitQuestionResponse(question_id, response, password));
+    }
   );
 
   // ── Tools: Users & Activity ─────────────────────────────────
@@ -872,11 +885,11 @@ function createServer(opts: ServerOptions): McpServer {
   tool(
     "upload_file",
     "Upload a file to Ed and return its static link (embed it in post content). " +
-      (opts.allowLocalFiles
-        ? "Pass either `path` (a local file) or `content_base64` + `filename`."
+      (opts.uploadDir
+        ? `Pass either \`path\` (a file inside ${opts.uploadDir}) or \`content_base64\` + \`filename\`.`
         : "Pass `content_base64` + `filename` (local paths are disabled on this server)."),
     {
-      path: z.string().optional().describe("Absolute path of a local file (stdio mode only)"),
+      path: z.string().optional().describe("Path of a local file inside ED_UPLOAD_DIR"),
       content_base64: z.string().optional().describe("File bytes, base64-encoded"),
       filename: z.string().optional().describe("File name (required with content_base64)"),
       content_type: z.string().optional().describe("MIME type; guessed from the extension if omitted"),
@@ -886,12 +899,7 @@ function createServer(opts: ServerOptions): McpServer {
         let data: Uint8Array;
         let name: string;
         if (path !== undefined) {
-          // Over HTTP, a path would let any client read files on the host and send them to Ed.
-          if (!opts.allowLocalFiles) throw new Error("Local file paths are disabled in HTTP mode; use content_base64.");
-          const info = await stat(path);
-          if (!info.isFile()) throw new Error(`Not a regular file: ${path}`);
-          if (info.size > MAX_UPLOAD_BYTES) throw new Error(`File too large (${info.size} bytes, max ${MAX_UPLOAD_BYTES})`);
-          data = await readFile(path);
+          data = await readFile(await resolveUploadPath(path, opts.uploadDir, MAX_UPLOAD_BYTES));
           name = filename ?? basename(path);
         } else if (content_base64 !== undefined) {
           if (!filename) throw new Error("filename is required with content_base64");
@@ -994,7 +1002,7 @@ function createServer(opts: ServerOptions): McpServer {
 const transportMode = process.env.MCP_TRANSPORT ?? "stdio";
 
 async function runStdio() {
-  const server = createServer({ allowLocalFiles: true });
+  const server = createServer({ uploadDir: process.env.ED_UPLOAD_DIR || undefined });
   await server.connect(new StdioServerTransport());
   console.error(`edstem-mcp server running on stdio (region: ${region})`);
 }
@@ -1037,7 +1045,7 @@ function runHttp() {
   // self-contained Ed API request.
   app.post("/mcp", async (req, res) => {
     try {
-      const server = createServer({ allowLocalFiles: false });
+      const server = createServer({});
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
       });

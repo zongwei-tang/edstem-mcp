@@ -21,6 +21,7 @@ Always `npm run build` before `npm run start` — there's no dev server with hot
 
 - `ED_API_TOKEN` (required) — Ed API token from https://edstem.org/us/settings/api-tokens
 - `ED_REGION` (optional, default `"us"`) — region prefix (e.g., `us`, `au`)
+- `ED_UPLOAD_DIR` (optional) — the only directory `upload_file` may read local files from (stdio only; realpath-checked in `src/upload.ts`). Unset = local paths disabled.
 
 ## Architecture
 
@@ -37,6 +38,6 @@ Four source files in `src/`, ESM (`"type": "module"`), strict TypeScript:
 - Content (threads/comments) always goes through markdown→XML conversion unless it already starts with `<document`.
 - The `editThread` method in the API client fetches the current thread first, then merges changes — partial updates are supported at the tool level.
 - `search_threads` uses the server-side `courses/{id}/threads/search` endpoint and only falls back to filtering the newest 100 threads locally on 404/405.
-- `upload_file` accepts a local `path` only in stdio mode (`allowLocalFiles`); over HTTP a path would let any client exfiltrate host files, so it requires `content_base64`.
+- `upload_file` reads a local `path` only inside `ED_UPLOAD_DIR` and only in stdio mode; thread content is untrusted, so an injected "upload this file" must not reach arbitrary files. Over HTTP it requires `content_base64`.
 - Endpoint paths come from Ed's own web client: the `DiscussionApi`/`NotificationsApi`/lesson API classes in the main `edcdn.net/js/*.js` bundle (search it for `this.fetch.<verb>(`). Generic thread/comment actions post to `${kind}s/${id}/${action}`.
 - Endpoints are reverse-engineered; `scripts/smoke.mjs` is a read-only live check (status codes and key names only).

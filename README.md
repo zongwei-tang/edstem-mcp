@@ -14,6 +14,7 @@ Set your API token (get one at https://edstem.org/us/settings/api-tokens):
 ```bash
 export ED_API_TOKEN=your_token
 export ED_REGION=us  # optional: us (default), au, etc.
+export ED_UPLOAD_DIR=~/ed-uploads  # optional: lets upload_file read local files, only from this directory (stdio only)
 ```
 
 ## Claude Code
@@ -59,10 +60,10 @@ Add to `~/.claude.json`:
 | `watch_thread` | Watch a thread to get notified of new replies, or stop watching (watch=false) |
 | `mark_thread_read` | Mark a thread as read, or as unread (read=false) |
 | `mark_all_threads_read` ⚠️ | Mark every thread in a course as read |
-| `delete_thread` ⚠️ | Delete a thread (Ed soft-deletes; restore_thread undoes it) |
+| `delete_thread` ⚠️ | Delete a thread |
 | `restore_thread` | Restore a deleted thread |
 | `mark_duplicate` | Mark a thread as a duplicate of another thread |
-| `moderate_thread` | Approve or reject a thread awaiting moderation (staff) |
+| `moderate_thread` ⚠️ | Approve or reject a thread awaiting moderation (staff) |
 | `list_categories` | List a course's discussion categories and subcategories (use these names for post_thread / search_threads) |
 | `vote_comment` | Upvote or downvote a comment or answer, or remove your vote |
 | `post_comment` | Post a comment or answer on a thread |
@@ -72,11 +73,11 @@ Add to `~/.claude.json`:
 | `accept_answer` | Accept an answer on your question thread, or un-accept it (accept=false) |
 | `resolve_comment` | Mark a comment (follow-up) as resolved, or unresolved (resolved=false) |
 | `edit_comment` ⚠️ | Replace the body of a comment or answer |
-| `set_comment_type` | Convert a comment into an answer or an answer into a comment (Ed also makes it non-private) |
-| `delete_comment` ⚠️ | Delete a comment or answer (Ed soft-deletes; restore_comment undoes it) |
+| `set_comment_type` ⚠️ | Convert a comment into an answer or an answer into a comment (Ed also makes it non-private) |
+| `delete_comment` ⚠️ | Delete a comment or answer |
 | `restore_comment` | Restore a deleted comment or answer |
 | `list_notifications` | List your Ed notifications (newest first) |
-| `mark_notifications_read` | Mark notifications as read |
+| `mark_notifications_read` ⚠️ | Mark notifications as read |
 | `delete_notifications` ⚠️ | Delete notifications from your inbox |
 | `get_poll` | Get a poll embedded in a thread (its options and results) |
 | `vote_poll` | Vote in a poll |
