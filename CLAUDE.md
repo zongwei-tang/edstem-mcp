@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-MCP (Model Context Protocol) server that exposes the Ed Discussion (edstem.org) API to Claude and other MCP clients. It runs over stdio (default) or Streamable HTTP (`MCP_TRANSPORT=http`) and provides 31 tools and 2 resources for interacting with Ed courses, threads, comments, and users.
+MCP (Model Context Protocol) server that exposes the Ed Discussion (edstem.org) API to Claude and other MCP clients. It runs over stdio (default) or Streamable HTTP (`MCP_TRANSPORT=http`) and provides 52 tools and 2 resources for interacting with Ed courses, threads, comments, and users.
 
 ## Commands
 
@@ -38,4 +38,5 @@ Four source files in `src/`, ESM (`"type": "module"`), strict TypeScript:
 - The `editThread` method in the API client fetches the current thread first, then merges changes — partial updates are supported at the tool level.
 - `search_threads` uses the server-side `courses/{id}/threads/search` endpoint and only falls back to filtering the newest 100 threads locally on 404/405.
 - `upload_file` accepts a local `path` only in stdio mode (`allowLocalFiles`); over HTTP a path would let any client exfiltrate host files, so it requires `content_base64`.
+- Endpoint paths come from Ed's own web client: the `DiscussionApi`/`NotificationsApi`/lesson API classes in the main `edcdn.net/js/*.js` bundle (search it for `this.fetch.<verb>(`). Generic thread/comment actions post to `${kind}s/${id}/${action}`.
 - Endpoints are reverse-engineered; `scripts/smoke.mjs` is a read-only live check (status codes and key names only).

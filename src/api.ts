@@ -16,6 +16,16 @@ import type {
   EdUserResponse,
 } from "./types.js";
 
+export type Vote = "up" | "down" | "none";
+const VOTE_ACTION: Record<Vote, string> = { up: "upvote", down: "downvote", none: "unvote" };
+
+function withPassword(
+  params: Record<string, string | number>,
+  password?: string
+): Record<string, string | number> {
+  return password ? { ...params, password } : params;
+}
+
 export class EdApiError extends Error {
   constructor(
     public status: number,
@@ -62,14 +72,14 @@ export class EdApiClient {
     };
     // FormData sets its own multipart Content-Type (with boundary)
     const isForm = body instanceof FormData;
-    if (body && !isForm) {
+    if (body !== undefined && !isForm) {
       headers["Content-Type"] = "application/json";
     }
 
     const response = await fetch(url, {
       method,
       headers,
-      body: isForm ? body : body ? JSON.stringify(body) : undefined,
+      body: isForm ? body : body !== undefined ? JSON.stringify(body) : undefined,
       signal: AbortSignal.timeout(30_000),
     });
 
@@ -233,10 +243,15 @@ export class EdApiClient {
     await this.request("POST", `threads/${threadId}/unstar`);
   }
 
-  // Paths below are from bunizao/edstem-cli src/ed/client.ts (threadAction).
+  // Paths below match Ed's own web client (DiscussionApi in the edcdn.net app
+  // bundle, read 2026-11-21): threadAction() posts to `${kind}s/${id}/${action}`.
 
-  async voteThread(threadId: number, up: boolean): Promise<void> {
-    await this.request("POST", `threads/${threadId}/${up ? "upvote" : "unvote"}`);
+  private async action(kind: "thread" | "comment", id: number, action: string): Promise<void> {
+    await this.request("POST", `${kind}s/${id}/${action}`);
+  }
+
+  async voteThread(threadId: number, vote: Vote): Promise<void> {
+    await this.action("thread", threadId, VOTE_ACTION[vote]);
   }
 
   async watchThread(threadId: number, watch: boolean): Promise<void> {
@@ -244,11 +259,31 @@ export class EdApiClient {
   }
 
   async markThreadRead(threadId: number, read: boolean): Promise<void> {
-    await this.request("POST", `threads/${threadId}/${read ? "read" : "unread"}`);
+    await this.action("thread", threadId, read ? "read" : "unread");
   }
 
   async markAllThreadsRead(courseId: number): Promise<void> {
     await this.request("POST", `courses/${courseId}/threads/read_all`);
+  }
+
+  /** Staff moderation of threads awaiting approval. */
+  async moderateThread(threadId: number, approve: boolean): Promise<void> {
+    await this.action("thread", threadId, approve ? "approve" : "reject");
+  }
+
+  async markDuplicate(threadId: number, duplicateOfThreadId: number): Promise<void> {
+    await this.request("POST", `threads/${threadId}/mark_duplicate`, {
+      duplicate_id: duplicateOfThreadId,
+    });
+  }
+
+  /** Delete a thread or comment (Ed soft-deletes; see restore()). */
+  async destroy(kind: "thread" | "comment", id: number): Promise<void> {
+    await this.request("DELETE", `${kind}s/${id}`);
+  }
+
+  async restore(kind: "thread" | "comment", id: number): Promise<void> {
+    await this.request("PUT", `${kind}s/${id}/restore`);
   }
 
   // ── Comments ──────────────────────────────────────────────
@@ -300,12 +335,114 @@ export class EdApiClient {
     await this.request("POST", `comments/${commentId}/unendorse`);
   }
 
-  async acceptAnswer(threadId: number, commentId: number): Promise<void> {
-    await this.request("POST", `threads/${threadId}/accept/${commentId}`);
+  /** Ed's web client uses comments/{id}/accept (not threads/{id}/accept/{comment}). */
+  async acceptAnswer(commentId: number, accept = true): Promise<void> {
+    await this.action("comment", commentId, accept ? "accept" : "unaccept");
   }
 
-  async voteComment(commentId: number, up: boolean): Promise<void> {
-    await this.request("POST", `comments/${commentId}/${up ? "upvote" : "unvote"}`);
+  async voteComment(commentId: number, vote: Vote): Promise<void> {
+    await this.action("comment", commentId, VOTE_ACTION[vote]);
+  }
+
+  async resolveComment(commentId: number, resolved: boolean): Promise<void> {
+    await this.action("comment", commentId, resolved ? "resolve" : "unresolve");
+  }
+
+  /** Ed's updateComment always sends is_private and is_anonymous, so callers must pass both. */
+  async editComment(
+    commentId: number,
+    content: string,
+    opts: { is_private: boolean; is_anonymous: boolean }
+  ): Promise<{ comment: EdComment }> {
+    return this.request<{ comment: EdComment }>("PUT", `comments/${commentId}`, {
+      comment: { content, is_private: opts.is_private, is_anonymous: opts.is_anonymous },
+    });
+  }
+
+  /** Convert between comment and answer. Ed's web client also clears is_private here. */
+  async setCommentType(commentId: number, type: "comment" | "answer"): Promise<{ comment: EdComment }> {
+    return this.request<{ comment: EdComment }>("PUT", `comments/${commentId}`, {
+      comment: { type, is_private: false },
+    });
+  }
+
+  // ── Notifications ─────────────────────────────────────────
+
+  async listNotifications(
+    opts: { beforeId?: number; unreadOnly?: boolean } = {}
+  ): Promise<{ has_more: boolean; notes: unknown[] }> {
+    const params: Record<string, string | number> = {};
+    if (opts.beforeId !== undefined) params.id = opts.beforeId;
+    if (opts.unreadOnly) params.unread = 1;
+    const res = await this.request<{ has_more?: boolean; notes?: unknown[] }>(
+      "GET",
+      "notifications/before",
+      undefined,
+      params
+    );
+    return { has_more: !!res?.has_more, notes: res?.notes ?? [] };
+  }
+
+  /** Mark notifications as read (Ed calls this "clicked"). Omit ids to mark all. */
+  async markNotificationsRead(ids?: number[]): Promise<void> {
+    if (ids === undefined) {
+      await this.request("POST", "notifications/clicked_all");
+    } else {
+      await this.request("POST", "notifications/clicked", { ids });
+    }
+  }
+
+  async deleteNotifications(ids: number[]): Promise<void> {
+    await this.request("POST", "notifications/delete", { ids });
+  }
+
+  // ── Polls ─────────────────────────────────────────────────
+
+  async getPoll(pollId: number): Promise<unknown> {
+    return this.request("GET", `polls/${pollId}`);
+  }
+
+  async votePoll(pollId: number, optionIndices: number[]): Promise<unknown> {
+    return this.request("POST", `polls/${pollId}/responses`, { option_indices: optionIndices });
+  }
+
+  async revokePollVote(pollId: number): Promise<void> {
+    await this.request("DELETE", `polls/${pollId}/responses`);
+  }
+
+  // ── Lessons ───────────────────────────────────────────────
+
+  async listLessons(courseId: number): Promise<unknown> {
+    return this.request("GET", `courses/${courseId}/lessons`);
+  }
+
+  async getLesson(lessonId: number, password?: string): Promise<unknown> {
+    return this.request("GET", `lessons/${lessonId}`, undefined, withPassword({ view: 1 }, password));
+  }
+
+  async getSlide(slideId: number, password?: string): Promise<unknown> {
+    return this.request("GET", `lessons/slides/${slideId}`, undefined, withPassword({ view: 1 }, password));
+  }
+
+  async getSlideQuestions(slideId: number, password?: string): Promise<unknown> {
+    return this.request("GET", `lessons/slides/${slideId}/questions`, undefined, withPassword({}, password));
+  }
+
+  async completeSlide(slideId: number, password?: string): Promise<void> {
+    await this.request("PUT", `lessons/slides/${slideId}/complete`, undefined, withPassword({}, password));
+  }
+
+  /**
+   * Answer a quiz question. Ed's client sends the raw response as the JSON body
+   * (e.g. an array of choice indices for multiple choice).
+   */
+  async submitQuestionResponse(questionId: number, response: unknown, password?: string): Promise<unknown> {
+    return this.request(
+      "POST",
+      `lessons/slides/questions/${questionId}/responses`,
+      response,
+      withPassword({}, password)
+    );
   }
 
   // ── Course ────────────────────────────────────────────────

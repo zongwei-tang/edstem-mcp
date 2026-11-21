@@ -84,6 +84,20 @@ const TOOL_ANNOTATIONS: Record<string, Record<string, boolean>> = {
   reply_to_comment: WRITE,
   upload_file: WRITE,
   upload_file_from_url: WRITE,
+  list_notifications: READ_ONLY,
+  get_poll: READ_ONLY,
+  list_lessons: READ_ONLY,
+  get_lesson: READ_ONLY,
+  get_slide: READ_ONLY,
+  get_slide_questions: READ_ONLY,
+  edit_comment: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+  vote_poll: WRITE,
+  // Graded / irreversible from the student's side.
+  complete_slide: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+  submit_quiz_answer: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+  delete_thread: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+  delete_comment: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+  delete_notifications: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
   // edit_thread overwrites the existing body
   edit_thread: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
 };
@@ -93,6 +107,8 @@ for (const name of [
   "endorse_thread", "unendorse_thread", "star_thread", "unstar_thread",
   "vote_thread", "watch_thread", "mark_thread_read",
   "endorse_comment", "unendorse_comment", "vote_comment", "accept_answer",
+  "resolve_comment", "set_comment_type", "restore_thread", "restore_comment", "mark_duplicate",
+  "moderate_thread", "mark_notifications_read", "revoke_poll_vote",
 ]) {
   TOOL_ANNOTATIONS[name] = WRITE_IDEMPOTENT;
 }
@@ -122,6 +138,16 @@ function createServer(opts: ServerOptions): McpServer {
     const annotations = TOOL_ANNOTATIONS[name];
     if (!annotations) throw new Error(`Missing TOOL_ANNOTATIONS entry for tool "${name}"`);
     return server.tool(name, description, schema, annotations, cb);
+  };
+
+  // Call the API; return `text` if given (for void calls), otherwise the JSON result.
+  const run = async (fn: () => Promise<unknown>, text?: string) => {
+    try {
+      const data = await fn();
+      return text !== undefined ? msg(text) : ok(data ?? { ok: true });
+    } catch (err) {
+      return fail(err);
+    }
   };
 
   // ── Resources ───────────────────────────────────────────────
@@ -421,15 +447,15 @@ function createServer(opts: ServerOptions): McpServer {
 
   tool(
     "vote_thread",
-    "Upvote a thread, or remove your vote (up=false)",
+    "Upvote or downvote a thread, or remove your vote",
     {
       thread_id: z.number().describe("Global thread ID"),
-      up: z.boolean().default(true).describe("true = upvote, false = remove vote"),
+      vote: z.enum(["up", "down", "none"]).default("up").describe('"up" = upvote, "down" = downvote, "none" = remove your vote'),
     },
-    async ({ thread_id, up }) => {
+    async ({ thread_id, vote }) => {
       try {
-        await api.voteThread(thread_id, up);
-        return msg(`Thread ${thread_id} ${up ? "upvoted" : "vote removed"}.`);
+        await api.voteThread(thread_id, vote);
+        return msg(`Thread ${thread_id}: vote set to "${vote}".`);
       } catch (err) {
         return fail(err);
       }
@@ -484,6 +510,42 @@ function createServer(opts: ServerOptions): McpServer {
     }
   );
 
+  tool(
+    "delete_thread",
+    "Delete a thread (Ed soft-deletes; restore_thread undoes it)",
+    { thread_id: z.number().describe("Global thread ID") },
+    async ({ thread_id }) => run(() => api.destroy("thread", thread_id), `Thread ${thread_id} deleted.`)
+  );
+
+  tool(
+    "restore_thread",
+    "Restore a deleted thread",
+    { thread_id: z.number().describe("Global thread ID") },
+    async ({ thread_id }) => run(() => api.restore("thread", thread_id), `Thread ${thread_id} restored.`)
+  );
+
+  tool(
+    "mark_duplicate",
+    "Mark a thread as a duplicate of another thread",
+    {
+      thread_id: z.number().describe("The duplicate thread (global ID)"),
+      duplicate_of: z.number().describe("The original thread it duplicates (global ID)"),
+    },
+    async ({ thread_id, duplicate_of }) => run(() => api.markDuplicate(thread_id, duplicate_of),
+      `Thread ${thread_id} marked as duplicate of ${duplicate_of}.`)
+  );
+
+  tool(
+    "moderate_thread",
+    "Approve or reject a thread awaiting moderation (staff)",
+    {
+      thread_id: z.number().describe("Global thread ID"),
+      approve: z.boolean().describe("true = approve, false = reject"),
+    },
+    async ({ thread_id, approve }) => run(() => api.moderateThread(thread_id, approve),
+      `Thread ${thread_id} ${approve ? "approved" : "rejected"}.`)
+  );
+
   // ── Tools: Course ───────────────────────────────────────────
 
   tool(
@@ -503,15 +565,15 @@ function createServer(opts: ServerOptions): McpServer {
 
   tool(
     "vote_comment",
-    "Upvote a comment or answer, or remove your vote (up=false)",
+    "Upvote or downvote a comment or answer, or remove your vote",
     {
       comment_id: z.number().describe("Comment ID"),
-      up: z.boolean().default(true).describe("true = upvote, false = remove vote"),
+      vote: z.enum(["up", "down", "none"]).default("up").describe('"up" = upvote, "down" = downvote, "none" = remove your vote'),
     },
-    async ({ comment_id, up }) => {
+    async ({ comment_id, vote }) => {
       try {
-        await api.voteComment(comment_id, up);
-        return msg(`Comment ${comment_id} ${up ? "upvoted" : "vote removed"}.`);
+        await api.voteComment(comment_id, vote);
+        return msg(`Comment ${comment_id}: vote set to "${vote}".`);
       } catch (err) {
         return fail(err);
       }
@@ -593,19 +655,168 @@ function createServer(opts: ServerOptions): McpServer {
 
   tool(
     "accept_answer",
-    "Accept a comment as the answer to a question thread",
+    "Accept an answer on your question thread, or un-accept it (accept=false)",
     {
-      thread_id: z.number().describe("Global thread ID"),
-      comment_id: z.number().describe("Comment ID to accept"),
+      comment_id: z.number().describe("ID of the answer to accept"),
+      accept: z.boolean().default(true).describe("true = accept, false = un-accept"),
     },
-    async ({ thread_id, comment_id }) => {
-      try {
-        await api.acceptAnswer(thread_id, comment_id);
-        return msg(`Comment ${comment_id} accepted as answer for thread ${thread_id}.`);
-      } catch (err) {
-        return fail(err);
-      }
-    }
+    async ({ comment_id, accept }) => run(() => api.acceptAnswer(comment_id, accept),
+      `Answer ${comment_id} ${accept ? "accepted" : "un-accepted"}.`)
+  );
+
+  tool(
+    "resolve_comment",
+    "Mark a comment (follow-up) as resolved, or unresolved (resolved=false)",
+    {
+      comment_id: z.number().describe("Comment ID"),
+      resolved: z.boolean().default(true),
+    },
+    async ({ comment_id, resolved }) => run(() => api.resolveComment(comment_id, resolved),
+      `Comment ${comment_id} marked ${resolved ? "resolved" : "unresolved"}.`)
+  );
+
+  tool(
+    "edit_comment",
+    "Replace the body of a comment or answer. Ed always resets visibility on edit, so pass the comment's current " +
+      "is_private / is_anonymous (see get_thread) unless you mean to change them.",
+    {
+      comment_id: z.number().describe("Comment ID"),
+      content: z.string().describe("New body (markdown or Ed XML)"),
+      is_private: z.boolean().describe("Private comment (required: Ed overwrites this field)"),
+      is_anonymous: z.boolean().describe("Anonymous comment (required: Ed overwrites this field)"),
+    },
+    async ({ comment_id, content, is_private, is_anonymous }) =>
+      run(() => api.editComment(comment_id, ensureEdXml(content), { is_private, is_anonymous }))
+  );
+
+  tool(
+    "set_comment_type",
+    "Convert a comment into an answer or an answer into a comment (Ed also makes it non-private)",
+    {
+      comment_id: z.number().describe("Comment ID"),
+      type: z.enum(["comment", "answer"]),
+    },
+    async ({ comment_id, type }) => run(() => api.setCommentType(comment_id, type))
+  );
+
+  tool(
+    "delete_comment",
+    "Delete a comment or answer (Ed soft-deletes; restore_comment undoes it)",
+    { comment_id: z.number().describe("Comment ID") },
+    async ({ comment_id }) => run(() => api.destroy("comment", comment_id), `Comment ${comment_id} deleted.`)
+  );
+
+  tool(
+    "restore_comment",
+    "Restore a deleted comment or answer",
+    { comment_id: z.number().describe("Comment ID") },
+    async ({ comment_id }) => run(() => api.restore("comment", comment_id), `Comment ${comment_id} restored.`)
+  );
+
+  // ── Tools: Notifications ────────────────────────────────────
+
+  tool(
+    "list_notifications",
+    "List your Ed notifications (newest first). Page with before_id = the last id you saw.",
+    {
+      before_id: z.number().optional().describe("Return notifications older than this notification id"),
+      unread_only: z.boolean().default(false),
+    },
+    async ({ before_id, unread_only }) =>
+      run(() => api.listNotifications({ beforeId: before_id, unreadOnly: unread_only }))
+  );
+
+  tool(
+    "mark_notifications_read",
+    "Mark notifications as read. Omit ids to mark all of them read.",
+    { ids: z.array(z.number()).optional().describe("Notification ids; omit for all") },
+    async ({ ids }) => run(() => api.markNotificationsRead(ids),
+      ids ? `${ids.length} notification(s) marked read.` : "All notifications marked read.")
+  );
+
+  tool(
+    "delete_notifications",
+    "Delete notifications from your inbox",
+    { ids: z.array(z.number()).min(1).describe("Notification ids") },
+    async ({ ids }) => run(() => api.deleteNotifications(ids), `${ids.length} notification(s) deleted.`)
+  );
+
+  // ── Tools: Polls ────────────────────────────────────────────
+
+  tool(
+    "get_poll",
+    "Get a poll embedded in a thread (its options and results)",
+    { poll_id: z.number().describe("Poll ID (from the thread document)") },
+    async ({ poll_id }) => run(() => api.getPoll(poll_id))
+  );
+
+  tool(
+    "vote_poll",
+    "Vote in a poll",
+    {
+      poll_id: z.number().describe("Poll ID"),
+      option_indices: z.array(z.number().int().min(0)).min(1).describe("0-based indices of the chosen options"),
+    },
+    async ({ poll_id, option_indices }) => run(() => api.votePoll(poll_id, option_indices))
+  );
+
+  tool(
+    "revoke_poll_vote",
+    "Withdraw your vote from a poll",
+    { poll_id: z.number().describe("Poll ID") },
+    async ({ poll_id }) => run(() => api.revokePollVote(poll_id), `Vote in poll ${poll_id} withdrawn.`)
+  );
+
+  // ── Tools: Lessons ──────────────────────────────────────────
+
+  const password = z.string().optional().describe("Lesson password, if the lesson is protected");
+
+  tool(
+    "list_lessons",
+    "List a course's lessons and modules",
+    { course_id: z.number().describe("Course ID") },
+    async ({ course_id }) => run(() => api.listLessons(course_id))
+  );
+
+  tool(
+    "get_lesson",
+    "Get a lesson with its slides (opens it as a view, like the web UI)",
+    { lesson_id: z.number().describe("Lesson ID"), password },
+    async ({ lesson_id, password }) => run(() => api.getLesson(lesson_id, password))
+  );
+
+  tool(
+    "get_slide",
+    "Get one lesson slide, including its content",
+    { slide_id: z.number().describe("Slide ID"), password },
+    async ({ slide_id, password }) => run(() => api.getSlide(slide_id, password))
+  );
+
+  tool(
+    "get_slide_questions",
+    "Get the quiz questions on a lesson slide",
+    { slide_id: z.number().describe("Slide ID"), password },
+    async ({ slide_id, password }) => run(() => api.getSlideQuestions(slide_id, password))
+  );
+
+  tool(
+    "complete_slide",
+    "Mark a lesson slide as completed. This can count toward participation grades and cannot be undone.",
+    { slide_id: z.number().describe("Slide ID"), password },
+    async ({ slide_id, password }) => run(() => api.completeSlide(slide_id, password), `Slide ${slide_id} completed.`)
+  );
+
+  tool(
+    "submit_quiz_answer",
+    "Submit an answer to a lesson quiz question. This is graded work and may not be changeable afterwards. " +
+      "For multiple choice, response is an array of 0-based choice indices.",
+    {
+      question_id: z.number().describe("Question ID (from get_slide_questions)"),
+      response: z.unknown().describe("Answer payload, e.g. [1] for the second choice"),
+      password,
+    },
+    async ({ question_id, response, password }) =>
+      run(() => api.submitQuestionResponse(question_id, response, password))
   );
 
   // ── Tools: Users & Activity ─────────────────────────────────
