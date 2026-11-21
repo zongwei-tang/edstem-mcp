@@ -91,11 +91,13 @@ const TOOL_ANNOTATIONS: Record<string, Record<string, boolean>> = {
 for (const name of [
   "lock_thread", "unlock_thread", "pin_thread", "unpin_thread",
   "endorse_thread", "unendorse_thread", "star_thread", "unstar_thread",
-  "vote_thread", "watch_thread", "mark_thread_read", "mark_all_threads_read",
+  "vote_thread", "watch_thread", "mark_thread_read",
   "endorse_comment", "unendorse_comment", "vote_comment", "accept_answer",
 ]) {
   TOOL_ANNOTATIONS[name] = WRITE_IDEMPOTENT;
 }
+// Wipes unread state for the whole course and cannot be undone.
+TOOL_ANNOTATIONS.mark_all_threads_read = { ...WRITE_IDEMPOTENT, destructiveHint: true };
 
 // ── Server ──────────────────────────────────────────────────
 
