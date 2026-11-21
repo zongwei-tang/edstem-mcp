@@ -7,8 +7,8 @@
 const token = process.env.ED_API_TOKEN;
 const region = process.env.ED_REGION ?? "us";
 const courseId = Number(process.argv[2]);
-if (!token || !courseId) {
-  console.error("Usage: ED_API_TOKEN=... node scripts/smoke.mjs <course_id>");
+if (!token) {
+  console.error("ED_API_TOKEN is not set. Usage: node --env-file=.env scripts/smoke.mjs <course_id>");
   process.exit(1);
 }
 const base = `https://${region}.edstem.org/api/`;
@@ -22,6 +22,19 @@ async function get(path) {
     json = JSON.parse(await res.text());
   } catch {}
   return { status: res.status, json };
+}
+
+// Without a valid enrolled course id, list the choices (only in this terminal) and stop.
+const me = await get("user");
+const courses = me.json?.courses ?? [];
+if (!courses.some((c) => c.course?.id === courseId)) {
+  if (me.status !== 200) {
+    console.error(`GET user failed (${me.status}); check ED_API_TOKEN / ED_REGION.`);
+    process.exit(1);
+  }
+  console.error(courseId ? `Not enrolled in course ${courseId}. Enrolled courses:` : "Pass a course id. Enrolled courses:");
+  for (const c of courses) console.error(`  ${c.course.id}  ${c.course.code}  (${c.course.status})`);
+  process.exit(1);
 }
 
 const keys = (o) => (o && typeof o === "object" && !Array.isArray(o) ? Object.keys(o).join(",") : Array.isArray(o) ? `array[${o.length}]` : String(o));
