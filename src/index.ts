@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 import { timingSafeEqual } from "node:crypto";
 import express from "express";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, type ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { z } from "zod";
+import { z, type ZodRawShape } from "zod";
 import { EdApiClient, EdApiError } from "./api.js";
-import type { EdEditThreadParams } from "./types.js";
+import { readFile, stat } from "node:fs/promises";
+import { basename, extname } from "node:path";
+import type { EdEditThreadParams, EdThread } from "./types.js";
 import { edXmlToPlainText, ensureEdXml, markdownToEdXml } from "./content.js";
 
 // ── Config ──────────────────────────────────────────────────
@@ -41,13 +43,84 @@ function fail(err: unknown) {
   return { content: [{ type: "text" as const, text: errorText(err) }], isError: true as const };
 }
 
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+
+const MIME_BY_EXT: Record<string, string> = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".svg": "image/svg+xml",
+  ".pdf": "application/pdf",
+  ".txt": "text/plain",
+  ".md": "text/markdown",
+  ".csv": "text/csv",
+  ".json": "application/json",
+  ".zip": "application/zip",
+};
+
+function guessMime(filename: string): string {
+  return MIME_BY_EXT[extname(filename).toLowerCase()] ?? "application/octet-stream";
+}
+
+// MCP tool annotations (hints for clients deciding what needs confirmation).
+const READ_ONLY = { readOnlyHint: true, openWorldHint: true } as const;
+const WRITE = { readOnlyHint: false, destructiveHint: false, openWorldHint: true } as const;
+const WRITE_IDEMPOTENT = { ...WRITE, idempotentHint: true } as const;
+
+const TOOL_ANNOTATIONS: Record<string, Record<string, boolean>> = {
+  get_user: READ_ONLY,
+  list_threads: READ_ONLY,
+  get_thread: READ_ONLY,
+  get_course_thread: READ_ONLY,
+  search_threads: READ_ONLY,
+  list_categories: READ_ONLY,
+  list_users: READ_ONLY,
+  list_user_activity: READ_ONLY,
+  format_content: { readOnlyHint: true, openWorldHint: false },
+  post_thread: WRITE,
+  post_comment: WRITE,
+  reply_to_comment: WRITE,
+  upload_file: WRITE,
+  upload_file_from_url: WRITE,
+  // edit_thread overwrites the existing body
+  edit_thread: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+};
+// Toggle-style actions are all idempotent writes.
+for (const name of [
+  "lock_thread", "unlock_thread", "pin_thread", "unpin_thread",
+  "endorse_thread", "unendorse_thread", "star_thread", "unstar_thread",
+  "vote_thread", "watch_thread", "mark_thread_read", "mark_all_threads_read",
+  "endorse_comment", "unendorse_comment", "vote_comment", "accept_answer",
+]) {
+  TOOL_ANNOTATIONS[name] = WRITE_IDEMPOTENT;
+}
+
 // ── Server ──────────────────────────────────────────────────
 
-function createServer(): McpServer {
+interface ServerOptions {
+  /** Allow upload_file to read local paths. Only safe when the client is the local user (stdio). */
+  allowLocalFiles: boolean;
+}
+
+function createServer(opts: ServerOptions): McpServer {
   const server = new McpServer({
     name: "edstem",
     version: "1.0.0",
   });
+
+  // Every tool goes through here so it always carries annotations.
+  const tool = <Args extends ZodRawShape>(
+    name: string,
+    description: string,
+    schema: Args,
+    cb: ToolCallback<Args>
+  ) => {
+    const annotations = TOOL_ANNOTATIONS[name];
+    if (!annotations) throw new Error(`Missing TOOL_ANNOTATIONS entry for tool "${name}"`);
+    return server.tool(name, description, schema, annotations, cb);
+  };
 
   // ── Resources ───────────────────────────────────────────────
 
@@ -96,7 +169,7 @@ function createServer(): McpServer {
 
   // ── Tools: User ─────────────────────────────────────────────
 
-  server.tool("get_user", "Get authenticated user info and enrolled courses", {}, async () => {
+  tool("get_user", "Get authenticated user info and enrolled courses", {}, async () => {
     try {
       return ok(await api.getUser());
     } catch (err) {
@@ -106,7 +179,7 @@ function createServer(): McpServer {
 
   // ── Tools: Threads ──────────────────────────────────────────
 
-  server.tool(
+  tool(
     "list_threads",
     "List discussion threads in a course",
     {
@@ -142,7 +215,7 @@ function createServer(): McpServer {
     }
   );
 
-  server.tool(
+  tool(
     "get_thread",
     "Get a thread by global ID, including all comments and answers",
     {
@@ -157,7 +230,7 @@ function createServer(): McpServer {
     }
   );
 
-  server.tool(
+  tool(
     "get_course_thread",
     "Get a thread by its course-local number (the # shown in the Ed UI)",
     {
@@ -173,30 +246,43 @@ function createServer(): McpServer {
     }
   );
 
-  server.tool(
+  tool(
     "search_threads",
-    "Search threads in a course by title, content, or category",
+    "Search all threads in a course (server-side search across the whole course history). " +
+      "Falls back to filtering the newest threads locally if Ed's search endpoint is unavailable.",
     {
       course_id: z.number().describe("Course ID"),
-      query: z.string().describe("Search query (matches title, content, and category)"),
-      category: z.string().optional().describe("Filter by category name (exact match)"),
-      limit: z.number().min(1).max(100).default(50).describe("Max threads to fetch before filtering"),
+      query: z.string().describe("Search query"),
+      category: z.string().optional().describe("Filter by category name"),
+      subcategory: z.string().optional().describe("Filter by subcategory name"),
+      limit: z.number().min(1).max(100).default(50).describe("Max results"),
+      offset: z.number().min(0).default(0).describe("Pagination offset"),
     },
-    async ({ course_id, query, category, limit }) => {
+    async ({ course_id, query, category, subcategory, limit, offset }) => {
       try {
-        const threads = await api.listThreads(course_id, { limit, sort: "new" });
-        const q = query.toLowerCase();
-        const matches = threads.filter((t) => {
-          if (category && t.category.toLowerCase() !== category.toLowerCase()) {
-            return false;
-          }
-          return (
-            t.title.toLowerCase().includes(q) ||
-            t.category.toLowerCase().includes(q) ||
-            t.subcategory.toLowerCase().includes(q) ||
-            edXmlToPlainText(t.document ?? "").toLowerCase().includes(q)
-          );
-        });
+        let matches: EdThread[];
+        let mode = "server";
+        try {
+          matches = await api.searchThreads(course_id, query, { category, subcategory, limit, offset });
+        } catch (err) {
+          // Only fall back when the endpoint itself seems missing, not on auth errors.
+          if (!(err instanceof EdApiError) || (err.status !== 404 && err.status !== 405)) throw err;
+          mode = "local (newest threads only)";
+          const threads = await api.listThreads(course_id, { limit: 100, offset, sort: "new" });
+          const q = query.toLowerCase();
+          matches = threads
+            .filter((t) => {
+              if (category && t.category.toLowerCase() !== category.toLowerCase()) return false;
+              if (subcategory && t.subcategory.toLowerCase() !== subcategory.toLowerCase()) return false;
+              return (
+                t.title.toLowerCase().includes(q) ||
+                t.category.toLowerCase().includes(q) ||
+                t.subcategory.toLowerCase().includes(q) ||
+                edXmlToPlainText(t.document ?? "").toLowerCase().includes(q)
+              );
+            })
+            .slice(0, limit);
+        }
         const summary = matches.map((t) => ({
           id: t.id,
           number: t.number,
@@ -208,14 +294,14 @@ function createServer(): McpServer {
           is_answered: t.is_answered,
           created_at: t.created_at,
         }));
-        return ok(summary);
+        return ok({ search_mode: mode, results: summary });
       } catch (err) {
         return fail(err);
       }
     }
   );
 
-  server.tool(
+  tool(
     "post_thread",
     "Create a new discussion thread. Content can be markdown (auto-converted to Ed XML).",
     {
@@ -250,7 +336,7 @@ function createServer(): McpServer {
     }
   );
 
-  server.tool(
+  tool(
     "edit_thread",
     "Edit an existing thread. Only provided fields are updated.",
     {
@@ -303,7 +389,7 @@ function createServer(): McpServer {
   };
 
   for (const action of Object.keys(threadActions) as (keyof typeof threadActions)[]) {
-    server.tool(
+    tool(
       `${action}_thread`,
       threadActionDescs[action],
       { thread_id: z.number().describe("Global thread ID") },
@@ -318,9 +404,106 @@ function createServer(): McpServer {
     );
   }
 
+  tool(
+    "vote_thread",
+    "Upvote a thread, or remove your vote (up=false)",
+    {
+      thread_id: z.number().describe("Global thread ID"),
+      up: z.boolean().default(true).describe("true = upvote, false = remove vote"),
+    },
+    async ({ thread_id, up }) => {
+      try {
+        await api.voteThread(thread_id, up);
+        return msg(`Thread ${thread_id} ${up ? "upvoted" : "vote removed"}.`);
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  tool(
+    "watch_thread",
+    "Watch a thread to get notified of new replies, or stop watching (watch=false)",
+    {
+      thread_id: z.number().describe("Global thread ID"),
+      watch: z.boolean().default(true).describe("true = watch, false = unwatch"),
+    },
+    async ({ thread_id, watch }) => {
+      try {
+        await api.watchThread(thread_id, watch);
+        return msg(`Thread ${thread_id} ${watch ? "watched" : "unwatched"}.`);
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  tool(
+    "mark_thread_read",
+    "Mark a thread as read, or as unread (read=false)",
+    {
+      thread_id: z.number().describe("Global thread ID"),
+      read: z.boolean().default(true).describe("true = read, false = unread"),
+    },
+    async ({ thread_id, read }) => {
+      try {
+        await api.markThreadRead(thread_id, read);
+        return msg(`Thread ${thread_id} marked ${read ? "read" : "unread"}.`);
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  tool(
+    "mark_all_threads_read",
+    "Mark every thread in a course as read",
+    { course_id: z.number().describe("Course ID") },
+    async ({ course_id }) => {
+      try {
+        await api.markAllThreadsRead(course_id);
+        return msg(`All threads in course ${course_id} marked read.`);
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  // ── Tools: Course ───────────────────────────────────────────
+
+  tool(
+    "list_categories",
+    "List a course's discussion categories and subcategories (use these names for post_thread / search_threads)",
+    { course_id: z.number().describe("Course ID") },
+    async ({ course_id }) => {
+      try {
+        return ok(await api.listCategories(course_id));
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
   // ── Tools: Comments ─────────────────────────────────────────
 
-  server.tool(
+  tool(
+    "vote_comment",
+    "Upvote a comment or answer, or remove your vote (up=false)",
+    {
+      comment_id: z.number().describe("Comment ID"),
+      up: z.boolean().default(true).describe("true = upvote, false = remove vote"),
+    },
+    async ({ comment_id, up }) => {
+      try {
+        await api.voteComment(comment_id, up);
+        return msg(`Comment ${comment_id} ${up ? "upvoted" : "vote removed"}.`);
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  tool(
     "post_comment",
     "Post a comment or answer on a thread. Content can be markdown.",
     {
@@ -343,7 +526,7 @@ function createServer(): McpServer {
     }
   );
 
-  server.tool(
+  tool(
     "reply_to_comment",
     "Reply to an existing comment",
     {
@@ -365,7 +548,7 @@ function createServer(): McpServer {
     }
   );
 
-  server.tool(
+  tool(
     "endorse_comment",
     "Endorse a comment (staff)",
     { comment_id: z.number().describe("Comment ID") },
@@ -379,7 +562,7 @@ function createServer(): McpServer {
     }
   );
 
-  server.tool(
+  tool(
     "unendorse_comment",
     "Remove endorsement from a comment",
     { comment_id: z.number().describe("Comment ID") },
@@ -393,7 +576,7 @@ function createServer(): McpServer {
     }
   );
 
-  server.tool(
+  tool(
     "accept_answer",
     "Accept a comment as the answer to a question thread",
     {
@@ -412,7 +595,7 @@ function createServer(): McpServer {
 
   // ── Tools: Users & Activity ─────────────────────────────────
 
-  server.tool(
+  tool(
     "list_users",
     "List all users enrolled in a course (requires staff/admin)",
     { course_id: z.number().describe("Course ID") },
@@ -425,7 +608,7 @@ function createServer(): McpServer {
     }
   );
 
-  server.tool(
+  tool(
     "list_user_activity",
     "List a user's recent threads and comments in a course",
     {
@@ -446,7 +629,7 @@ function createServer(): McpServer {
 
   // ── Tools: Files ────────────────────────────────────────────
 
-  server.tool(
+  tool(
     "upload_file_from_url",
     "Upload a file to Ed from a URL, returns the static file link",
     { url: z.string().url().describe("Public URL of the file to upload") },
@@ -460,9 +643,49 @@ function createServer(): McpServer {
     }
   );
 
+  tool(
+    "upload_file",
+    "Upload a file to Ed and return its static link (embed it in post content). " +
+      (opts.allowLocalFiles
+        ? "Pass either `path` (a local file) or `content_base64` + `filename`."
+        : "Pass `content_base64` + `filename` (local paths are disabled on this server)."),
+    {
+      path: z.string().optional().describe("Absolute path of a local file (stdio mode only)"),
+      content_base64: z.string().optional().describe("File bytes, base64-encoded"),
+      filename: z.string().optional().describe("File name (required with content_base64)"),
+      content_type: z.string().optional().describe("MIME type; guessed from the extension if omitted"),
+    },
+    async ({ path, content_base64, filename, content_type }) => {
+      try {
+        let data: Uint8Array;
+        let name: string;
+        if (path !== undefined) {
+          // Over HTTP, a path would let any client read files on the host and send them to Ed.
+          if (!opts.allowLocalFiles) throw new Error("Local file paths are disabled in HTTP mode; use content_base64.");
+          const info = await stat(path);
+          if (!info.isFile()) throw new Error(`Not a regular file: ${path}`);
+          if (info.size > MAX_UPLOAD_BYTES) throw new Error(`File too large (${info.size} bytes, max ${MAX_UPLOAD_BYTES})`);
+          data = await readFile(path);
+          name = filename ?? basename(path);
+        } else if (content_base64 !== undefined) {
+          if (!filename) throw new Error("filename is required with content_base64");
+          data = Buffer.from(content_base64, "base64");
+          if (data.length > MAX_UPLOAD_BYTES) throw new Error(`File too large (max ${MAX_UPLOAD_BYTES} bytes)`);
+          name = filename;
+        } else {
+          throw new Error("Provide either path or content_base64");
+        }
+        const link = await api.uploadFile(data, name, content_type ?? guessMime(name));
+        return msg(`File uploaded: ${link}`);
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
   // ── Tools: Content helpers ──────────────────────────────────
 
-  server.tool(
+  tool(
     "format_content",
     "Convert markdown text to Ed Discussion XML format (preview, no API call)",
     { markdown: z.string().describe("Markdown text to convert") },
@@ -545,7 +768,7 @@ function createServer(): McpServer {
 const transportMode = process.env.MCP_TRANSPORT ?? "stdio";
 
 async function runStdio() {
-  const server = createServer();
+  const server = createServer({ allowLocalFiles: true });
   await server.connect(new StdioServerTransport());
   console.error(`edstem-mcp server running on stdio (region: ${region})`);
 }
@@ -588,7 +811,7 @@ function runHttp() {
   // self-contained Ed API request.
   app.post("/mcp", async (req, res) => {
     try {
-      const server = createServer();
+      const server = createServer({ allowLocalFiles: false });
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
       });

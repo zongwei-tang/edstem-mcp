@@ -4,7 +4,9 @@
 import type {
   EdActivityItem,
   EdAnalyticsUser,
+  EdCategory,
   EdComment,
+  EdCourse,
   EdEditThreadParams,
   EdFileResponse,
   EdGetThreadResponse,
@@ -58,14 +60,16 @@ export class EdApiClient {
       Authorization: `Bearer ${this.token}`,
       Accept: "application/json",
     };
-    if (body) {
+    // FormData sets its own multipart Content-Type (with boundary)
+    const isForm = body instanceof FormData;
+    if (body && !isForm) {
       headers["Content-Type"] = "application/json";
     }
 
     const response = await fetch(url, {
       method,
       headers,
-      body: body ? JSON.stringify(body) : undefined,
+      body: isForm ? body : body ? JSON.stringify(body) : undefined,
       signal: AbortSignal.timeout(30_000),
     });
 
@@ -125,6 +129,37 @@ export class EdApiClient {
       params
     );
     return res.threads;
+  }
+
+  /**
+   * Server-side thread search. Path and params are from community clients
+   * (pyedstem, looooonk/edstem-mcp); the response shape is not documented,
+   * so accept either `{ threads: [...] }` or a bare array.
+   */
+  async searchThreads(
+    courseId: number,
+    query: string,
+    opts: {
+      category?: string;
+      subcategory?: string;
+      limit?: number;
+      offset?: number;
+    } = {}
+  ): Promise<EdThread[]> {
+    const params: Record<string, string | number> = { query };
+    if (opts.category) params.category = opts.category;
+    if (opts.subcategory) params.subcategory = opts.subcategory;
+    if (opts.limit !== undefined) params.limit = opts.limit;
+    if (opts.offset !== undefined) params.offset = opts.offset;
+
+    const res = await this.request<{ threads?: EdThread[] } | EdThread[]>(
+      "GET",
+      `courses/${courseId}/threads/search`,
+      undefined,
+      params
+    );
+    if (Array.isArray(res)) return res;
+    return res?.threads ?? [];
   }
 
   async getThread(threadId: number): Promise<EdGetThreadResponse> {
@@ -198,6 +233,24 @@ export class EdApiClient {
     await this.request("POST", `threads/${threadId}/unstar`);
   }
 
+  // Paths below are from bunizao/edstem-cli src/ed/client.ts (threadAction).
+
+  async voteThread(threadId: number, up: boolean): Promise<void> {
+    await this.request("POST", `threads/${threadId}/${up ? "upvote" : "unvote"}`);
+  }
+
+  async watchThread(threadId: number, watch: boolean): Promise<void> {
+    await this.request("POST", `threads/${threadId}/watch`, { state: watch });
+  }
+
+  async markThreadRead(threadId: number, read: boolean): Promise<void> {
+    await this.request("POST", `threads/${threadId}/${read ? "read" : "unread"}`);
+  }
+
+  async markAllThreadsRead(courseId: number): Promise<void> {
+    await this.request("POST", `courses/${courseId}/threads/read_all`);
+  }
+
   // ── Comments ──────────────────────────────────────────────
 
   async postComment(
@@ -251,6 +304,40 @@ export class EdApiClient {
     await this.request("POST", `threads/${threadId}/accept/${commentId}`);
   }
 
+  async voteComment(commentId: number, up: boolean): Promise<void> {
+    await this.request("POST", `comments/${commentId}/${up ? "upvote" : "unvote"}`);
+  }
+
+  // ── Course ────────────────────────────────────────────────
+
+  async getCourse(courseId: number): Promise<{ course: EdCourse }> {
+    return this.request<{ course: EdCourse }>("GET", `courses/${courseId}`);
+  }
+
+  /**
+   * Discussion categories. edapi types them at
+   * course.settings.discussion.categories. We try GET courses/{id} first,
+   * then fall back to the course object embedded in GET user.
+   */
+  async listCategories(
+    courseId: number
+  ): Promise<{ categories: EdCategory[]; source: string }> {
+    const pick = (c: EdCourse | undefined) => c?.settings?.discussion?.categories;
+
+    let fromCourse: EdCategory[] | undefined;
+    try {
+      fromCourse = pick((await this.getCourse(courseId)).course);
+    } catch (err) {
+      if (!(err instanceof EdApiError) || err.status < 400 || err.status >= 500) throw err;
+    }
+    if (fromCourse) return { categories: fromCourse, source: `courses/${courseId}` };
+
+    const user = await this.getUser();
+    const enrolled = user.courses.find((c) => c.course.id === courseId);
+    if (!enrolled) throw new Error(`Not enrolled in course ${courseId}`);
+    return { categories: pick(enrolled.course) ?? [], source: "user" };
+  }
+
   // ── User activity ─────────────────────────────────────────
 
   async listUserActivity(
@@ -293,6 +380,18 @@ export class EdApiClient {
       throw new Error("Only https:// URLs are allowed for file uploads");
     }
     const res = await this.request<EdFileResponse>("POST", "files/url", { url });
+    return `${this.staticFileBaseUrl}${res.file.id}`;
+  }
+
+  /** Multipart upload of raw bytes (edapi upload_file: POST files, field "attachment"). */
+  async uploadFile(
+    data: Uint8Array,
+    filename: string,
+    contentType = "application/octet-stream"
+  ): Promise<string> {
+    const form = new FormData();
+    form.append("attachment", new Blob([new Uint8Array(data)], { type: contentType }), filename);
+    const res = await this.request<EdFileResponse>("POST", "files", form);
     return `${this.staticFileBaseUrl}${res.file.id}`;
   }
 }

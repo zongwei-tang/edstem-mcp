@@ -34,7 +34,7 @@ Add to `~/.claude.json`:
 }
 ```
 
-## Tools (22)
+## Tools (31)
 
 | Tool | Description |
 |------|-------------|
@@ -42,7 +42,7 @@ Add to `~/.claude.json`:
 | `list_threads` | List threads in a course (sortable, paginated) |
 | `get_thread` | Get thread by global ID with comments |
 | `get_course_thread` | Get thread by course-local number (the # in the UI) |
-| `search_threads` | Search threads by title, content, or category |
+| `search_threads` | Server-side search across the whole course (category/subcategory filters, paginated) |
 | `post_thread` | Create a new thread (supports markdown input) |
 | `edit_thread` | Edit an existing thread |
 | `lock_thread` | Lock a thread |
@@ -53,6 +53,12 @@ Add to `~/.claude.json`:
 | `unendorse_thread` | Remove thread endorsement |
 | `star_thread` | Star/bookmark a thread |
 | `unstar_thread` | Remove star |
+| `vote_thread` | Upvote a thread, or remove your vote |
+| `watch_thread` | Watch / unwatch a thread for reply notifications |
+| `mark_thread_read` | Mark a thread read or unread |
+| `mark_all_threads_read` | Mark every thread in a course read |
+| `list_categories` | List a course's categories and subcategories |
+| `vote_comment` | Upvote a comment or answer, or remove your vote |
 | `post_comment` | Post a comment or answer on a thread |
 | `reply_to_comment` | Reply to an existing comment |
 | `endorse_comment` | Endorse a comment |
@@ -61,7 +67,16 @@ Add to `~/.claude.json`:
 | `list_users` | List course roster (staff/admin) |
 | `list_user_activity` | List a user's threads and comments |
 | `upload_file_from_url` | Upload a file to Ed from a URL |
+| `upload_file` | Upload a local file (stdio only) or base64 bytes |
 | `format_content` | Preview markdown to Ed XML conversion |
+
+Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`) so clients can decide which calls need confirmation.
+
+Ed has no public API docs. The newer endpoints (search, votes, watch, read state, categories, multipart upload) come from community clients ([edstem-cli](https://github.com/bunizao/edstem-cli), [edapi](https://github.com/smartspot2/edapi), pyedstem). To check them against your own account, run the read-only smoke test, which prints only status codes and key names:
+
+```bash
+node --env-file=.env scripts/smoke.mjs <course_id>
+```
 
 ## Resources (2)
 

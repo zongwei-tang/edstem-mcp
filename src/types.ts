@@ -37,6 +37,20 @@ export interface EdCourse {
   status: string;
   features: Record<string, boolean>;
   created_at: string;
+  /** Shape from edapi types/api_types/course.py; may be absent. */
+  settings?: {
+    discussion?: {
+      categories?: EdCategory[];
+      [key: string]: unknown;
+    };
+    [key: string]: unknown;
+  };
+}
+
+export interface EdCategory {
+  name: string;
+  subcategories: string[];
+  thread_template?: string | null;
 }
 
 export interface EdUserResponse {
