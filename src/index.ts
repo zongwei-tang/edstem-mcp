@@ -12,7 +12,7 @@ import { readFile } from "node:fs/promises";
 import { resolveUploadPath } from "./upload.js";
 import { basename, extname } from "node:path";
 import type { EdEditThreadParams, EdThread } from "./types.js";
-import { edXmlToPlainText, ensureEdXml, markdownToEdXml } from "./content.js";
+import { ensureEdXml, markdownToEdXml } from "./content.js";
 
 // ── Config ──────────────────────────────────────────────────
 
@@ -300,8 +300,8 @@ function createServer(api: EdApiClient, opts: ServerOptions = {}): McpServer {
       query: z.string().describe("Search query"),
       category: z.string().optional().describe("Filter by category name"),
       subcategory: z.string().optional().describe("Filter by subcategory name"),
-      limit: z.number().min(1).max(100).default(50).describe("Max results"),
-      offset: z.number().min(0).default(0).describe("Pagination offset"),
+      limit: z.number().int().min(1).max(100).default(50).describe("Max results"),
+      offset: z.number().int().min(0).default(0).describe("Pagination offset"),
     },
     async ({ course_id, query, category, subcategory, limit, offset }) => {
       try {
@@ -312,21 +312,8 @@ function createServer(api: EdApiClient, opts: ServerOptions = {}): McpServer {
         } catch (err) {
           // Only fall back when the endpoint itself seems missing, not on auth errors.
           if (!(err instanceof EdApiError) || (err.status !== 404 && err.status !== 405)) throw err;
-          mode = "local (newest threads only)";
-          const threads = await api.listThreads(course_id, { limit: 100, offset, sort: "new" });
-          const q = query.toLowerCase();
-          matches = threads
-            .filter((t) => {
-              if (category && t.category.toLowerCase() !== category.toLowerCase()) return false;
-              if (subcategory && t.subcategory.toLowerCase() !== subcategory.toLowerCase()) return false;
-              return (
-                t.title.toLowerCase().includes(q) ||
-                t.category.toLowerCase().includes(q) ||
-                t.subcategory.toLowerCase().includes(q) ||
-                edXmlToPlainText(t.document ?? "").toLowerCase().includes(q)
-              );
-            })
-            .slice(0, limit);
+          mode = "local (one page of newest threads; increase offset by limit for older ones)";
+          matches = await api.searchThreadsLocally(course_id, query, { category, subcategory, limit, offset });
         }
         const summary = matches.map((t) => ({
           id: t.id,

@@ -11,6 +11,7 @@
     "start": "node --env-file-if-exists=.env dist/index.js",
     "dev": "tsc --watch",
     "inspect": "npx @modelcontextprotocol/inspector node dist/index.js",
+    "pretest": "npm run build",
     "test": "node --test dist/test/*.test.js"
   },
   "dependencies": {

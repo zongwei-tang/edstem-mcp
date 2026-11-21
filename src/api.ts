@@ -15,6 +15,7 @@ import type {
   EdThread,
   EdUserResponse,
 } from "./types.js";
+import { edXmlToPlainText } from "./content.js";
 
 export type Vote = "up" | "down" | "none";
 const VOTE_ACTION: Record<Vote, string> = { up: "upvote", down: "downvote", none: "unvote" };
@@ -50,6 +51,12 @@ export class EdApiClient {
     this.token = token;
     this.baseUrl = `https://${region}.edstem.org/api/`;
     this.staticFileBaseUrl = `https://static.${region}.edusercontent.com/files/`;
+  }
+
+  private sanitizeErrorBody(body: string, limit: number): string {
+    // Redact before truncation so a token crossing the limit cannot leak a prefix.
+    const redacted = this.token ? body.replaceAll(this.token, "[REDACTED]") : body;
+    return redacted.replace(/Bearer\s+[^\s"'<>]+/gi, "Bearer [REDACTED]").slice(0, limit);
   }
 
   private async request<T = void>(
@@ -90,10 +97,7 @@ export class EdApiClient {
       } catch {
         errorBody = "(could not read response body)";
       }
-      // Truncate long error bodies and redact anything that looks like a token
-      const safeBody = errorBody
-        .slice(0, 500)
-        .replace(/Bearer\s+[^\s"]+/gi, "Bearer [REDACTED]");
+      const safeBody = this.sanitizeErrorBody(errorBody, 500);
       throw new EdApiError(
         response.status,
         safeBody,
@@ -109,7 +113,7 @@ export class EdApiClient {
     } catch {
       throw new EdApiError(
         response.status,
-        text.slice(0, 200),
+        this.sanitizeErrorBody(text, 200),
         `Ed API ${method} ${path}: invalid JSON response`
       );
     }
@@ -142,9 +146,8 @@ export class EdApiClient {
   }
 
   /**
-   * Server-side thread search. Path and params are from community clients
-   * (pyedstem, looooonk/edstem-mcp); the response shape is not documented,
-   * so accept either `{ threads: [...] }` or a bare array.
+   * Server-side search across the whole course (GET courses/{id}/threads/search,
+   * live-tested: returns { threads, total, users }). Accepts a bare array too.
    */
   async searchThreads(
     courseId: number,
@@ -174,6 +177,33 @@ export class EdApiClient {
 
   async getThread(threadId: number): Promise<EdGetThreadResponse> {
     return this.request<EdGetThreadResponse>("GET", `threads/${threadId}`);
+  }
+
+  /**
+   * Fallback when the search endpoint is unavailable: filter one page of the
+   * newest threads locally. Increase offset by limit to search older pages.
+   */
+  async searchThreadsLocally(
+    courseId: number,
+    query: string,
+    opts: { limit?: number; offset?: number; category?: string; subcategory?: string } = {}
+  ): Promise<EdThread[]> {
+    const threads = await this.listThreads(courseId, {
+      limit: opts.limit ?? 50,
+      offset: opts.offset ?? 0,
+      sort: "new",
+    });
+    const q = query.toLowerCase();
+    return threads.filter((thread) => {
+      if (opts.category !== undefined && (thread.category ?? "").toLowerCase() !== opts.category.toLowerCase()) {
+        return false;
+      }
+      if (opts.subcategory !== undefined && (thread.subcategory ?? "").toLowerCase() !== opts.subcategory.toLowerCase()) {
+        return false;
+      }
+      return [thread.title, thread.category, thread.subcategory, edXmlToPlainText(thread.document ?? thread.content ?? "")]
+        .some((value) => (value ?? "").toLowerCase().includes(q));
+    });
   }
 
   async getCourseThread(
