@@ -23,13 +23,19 @@ Always `npm run build` before `npm run start` — there's no dev server with hot
 - `ED_REGION` (optional, default `"us"`) — region prefix (e.g., `us`, `au`)
 - `ED_UPLOAD_DIR` (optional) — the only directory `upload_file` may read local files from (stdio only; realpath-checked in `src/upload.ts`). Unset = local paths disabled.
 
+## Deployment
+
+Railway project `edstem-mcp-oauth` (service `edstem-mcp`) auto-deploys from the **`feat/oauth-multi-tenant`** branch, not `main`, with `MCP_TRANSPORT=http`. Keep that branch equal to `main` (`git push origin main main:feat/oauth-multi-tenant`) or nothing ships. HTTP mode is multi-tenant OAuth 2.1 (`src/oauth.ts`): each client authorizes with its own Ed token on a consent page; tokens are in memory, so a redeploy logs everyone out.
+
 ## Architecture
 
-Four source files in `src/`, ESM (`"type": "module"`), strict TypeScript:
+Source files in `src/`, ESM (`"type": "module"`), strict TypeScript:
 
 - **`index.ts`** — MCP server entry point. Registers all tools and resources using `@modelcontextprotocol/sdk`. Each tool handler follows the pattern: validate input via zod schemas → call `EdApiClient` → return `ok(data)` or `fail(err)`. Thread action tools (lock/unlock/pin/etc.) are registered in a loop. All tools are registered through the local `tool()` helper, which requires an entry in `TOOL_ANNOTATIONS` (startup throws otherwise).
 - **`api.ts`** — `EdApiClient` class wrapping Ed's REST API with `fetch`. All HTTP goes through the private `request<T>()` method. `EdApiError` carries status + body for structured error reporting.
 - **`content.ts`** — Bidirectional content conversion. `markdownToEdXml()` converts markdown to Ed's XML `<document>` format. `edXmlToPlainText()` strips XML tags for search. Content starting with `<document` bypasses conversion (raw XML passthrough).
+- **`oauth.ts`** — OAuth 2.1 provider for HTTP mode (dynamic client registration, PKCE, consent page that collects and verifies the caller's Ed token). `createServer(api, opts)` gets a per-request `EdApiClient`.
+- **`upload.ts`** — `resolveUploadPath()`, the `ED_UPLOAD_DIR` confinement for `upload_file`.
 - **`types.ts`** — TypeScript interfaces for Ed API request/response shapes (reverse-engineered, not from an official schema).
 
 ## Key Patterns
