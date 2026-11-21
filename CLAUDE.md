@@ -25,7 +25,9 @@ Always `npm run build` before `npm run start` — there's no dev server with hot
 
 ## Deployment
 
-Railway project `edstem-mcp-oauth` (service `edstem-mcp`) auto-deploys from the **`feat/oauth-multi-tenant`** branch, not `main`, with `MCP_TRANSPORT=http`. Keep that branch equal to `main` (`git push origin main main:feat/oauth-multi-tenant`) or nothing ships. HTTP mode is multi-tenant OAuth 2.1 (`src/oauth.ts`): each client authorizes with its own Ed token on a consent page; tokens are in memory, so a redeploy logs everyone out.
+Railway project `edstem-mcp-oauth` (service `edstem-mcp`, `MCP_TRANSPORT=http`) is deployed by `.github/workflows/deploy.yml` on every push to `main`, via `railway up` with the repo secrets `RAILWAY_TOKEN` (project token) and `RAILWAY_SERVICE_ID`. Railway is **not** connected to the GitHub repo on purpose: its GitHub App would write Deployments/environments into this public repo, exposing Railway project names and ids. Keep the workflow free of an `environment:` key and keep `railway up` output out of the (public) Actions log for the same reason. Actions must be enabled on this fork.
+
+HTTP mode is multi-tenant OAuth 2.1 (`src/oauth.ts`): each client authorizes with its own Ed token on a consent page; tokens are in memory, so a redeploy logs everyone out.
 
 ## Architecture
 

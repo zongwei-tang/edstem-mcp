@@ -1,0 +1,51 @@
+# Deploys the HTTP server to Railway on every push to main.
+#
+# Why Actions instead of Railway's GitHub integration: when Railway is connected
+# to the repo, its GitHub App writes a Deployment + "production" environment to
+# this public repo on every deploy, exposing Railway project names and IDs.
+# Deploying with `railway up` from Actions creates no GitHub Deployments (this
+# job deliberately has no `environment:` key).
+#
+# Required repo secrets:
+#   RAILWAY_TOKEN       project token (Railway project > Settings > Tokens, production)
+#   RAILWAY_SERVICE_ID  id of the service to deploy
+#
+# Actions logs are public on a public repo, and `railway up` prints Railway URLs
+# containing project/service ids, so its output is kept out of the log.
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    container: ghcr.io/railwayapp/cli:latest
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to Railway
+        run: |
+          if [ -z "$RAILWAY_TOKEN" ] || [ -z "$RAILWAY_SERVICE_ID" ]; then
+            echo "RAILWAY_TOKEN / RAILWAY_SERVICE_ID secrets are not set; skipping deploy."
+            exit 0
+          fi
+          if railway up --service "$RAILWAY_SERVICE_ID" --ci > /tmp/railway.log 2>&1; then
+            echo "Deploy succeeded."
+          else
+            echo "Deploy failed. Output is hidden because this log is public; see the Railway dashboard."
+            exit 1
+          fi
